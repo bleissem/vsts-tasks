@@ -13,60 +13,119 @@ try {
     . "$PSScriptRoot\utilities.ps1"
     
     # Collect input values
-    $publishProfilePathSearchPattern = Get-VstsInput -Name publishProfilePath -Require
-    Write-Host (Get-VstsLocString -Key SearchingForPublishProfile -ArgumentList $publishProfilePathSearchPattern) 
-    $publishProfilePath = Find-VstsFiles -LegacyPattern $publishProfilePathSearchPattern
-    Assert-SingleItem $publishProfilePath $publishProfilePathSearchPattern
-    Assert-VstsPath -LiteralPath $publishProfilePath -PathType Leaf
-    Write-Host (Get-VstsLocString -Key FoundPublishProfile -ArgumentList $publishProfilePath)
-    
-    $applicationPackagePathSearchPattern = Get-VstsInput -Name applicationPackagePath -Require
-    Write-Host (Get-VstsLocString -Key SearchingForApplicationPackage -ArgumentList $applicationPackagePathSearchPattern)
 
-    $applicationPackagePath = Find-VstsFiles -LegacyPattern $applicationPackagePathSearchPattern -IncludeDirectories
-    Assert-SingleItem $applicationPackagePath $applicationPackagePathSearchPattern
-    Assert-VstsPath -LiteralPath $applicationPackagePath -PathType Container
-    Write-Host (Get-VstsLocString -Key FoundApplicationPackage -ArgumentList $applicationPackagePath)
-
-    $aadServiceConnectionName = Get-VstsInput -Name aadServiceConnectionName -Require
-    $aadConnectedServiceEndpoint = Get-VstsEndpoint -Name $aadServiceConnectionName -Require
-
-    $publishProfile = Read-PublishProfile $publishProfilePath
-    $clusterConnectionParameters = $publishProfile.ClusterConnectionParameters
-    
-    if (-not $clusterConnectionParameters.ContainsKey("AzureActiveDirectory") -or $clusterConnectionParameters.Item("AzureActiveDirectory") -eq $false)
+    $publishProfilePath = Get-SinglePathOfType (Get-VstsInput -Name publishProfilePath) Leaf
+    if ($publishProfilePath)
     {
-        throw (Get-VstsLocString -Key AzureActiveDirectoryNotSet)
+        $publishProfile = Read-PublishProfile $publishProfilePath
     }
-    
-    # Connect to cluster
-    $securityToken = Get-AadSecurityToken -ClusterConnectionParameters $clusterConnectionParameters -ConnectedServiceEndpoint $aadConnectedServiceEndpoint
-    $clusterConnectionParameters["SecurityToken"] = $securityToken
-    $clusterConnectionParameters["WarningAction"] = "SilentlyContinue"
-    [void](Connect-ServiceFabricCluster @clusterConnectionParameters)
-    Write-Host (Get-VstsLocString -Key ConnectedToCluster)
+
+    $applicationPackagePath = Get-SinglePathOfType (Get-VstsInput -Name applicationPackagePath -Require) Container -Require
+
+    $serviceConnectionName = Get-VstsInput -Name serviceConnectionName -Require
+    $connectedServiceEndpoint = Get-VstsEndpoint -Name $serviceConnectionName -Require
+
+    $clusterConnectionParameters = @{}
     
     $regKey = "HKLM:\SOFTWARE\Microsoft\Service Fabric SDK"
     if (!(Test-Path $regKey))
     {
         throw (Get-VstsLocString -Key ServiceFabricSDKNotInstalled)
     }
+
+    # Override the publish profile's connection endpoint with the one defined on the associated service endpoint
+    $clusterConnectionParameters["ConnectionEndpoint"] = ([System.Uri]$connectedServiceEndpoint.url).Authority # Authority includes just the hostname and port
+
+    # Configure cluster connection pre-reqs
+    if ($connectedServiceEndpoint.Auth.Scheme -ne "None")
+    {
+        # Add server cert thumbprint (common to both auth-types)
+        if ($ConnectedServiceEndpoint.Auth.Parameters.ServerCertThumbprint)
+        {
+            $clusterConnectionParameters["ServerCertThumbprint"] = $ConnectedServiceEndpoint.Auth.Parameters.ServerCertThumbprint
+        }
+        else
+        {
+            Write-Warning (Get-VstsLocString -Key ServiceEndpointUpgradeWarning)
+            if ($publishProfile)
+            {
+                $clusterConnectionParameters["ServerCertThumbprint"] = $publishProfile.ClusterConnectionParameters["ServerCertThumbprint"]
+            }
+            else
+            {
+                throw (Get-VstsLocString -Key PublishProfileRequiredServerThumbprint)
+            }
+        }
+
+        # Add auth-specific parameters
+        if ($connectedServiceEndpoint.Auth.Scheme -eq "UserNamePassword")
+        {
+            # Setup the AzureActiveDirectory and ServerCertThumbprint parameters before getting the security token, because getting the security token
+            # requires a connection request to the cluster in order to get metadata and so these two parameters are needed for that request.
+            $clusterConnectionParameters["AzureActiveDirectory"] = $true
+
+            $securityToken = Get-AadSecurityToken -ClusterConnectionParameters $clusterConnectionParameters -ConnectedServiceEndpoint $connectedServiceEndpoint
+            $clusterConnectionParameters["SecurityToken"] = $securityToken
+            $clusterConnectionParameters["WarningAction"] = "SilentlyContinue"
+        }
+        elseif ($connectedServiceEndpoint.Auth.Scheme -eq "Certificate")
+        {
+            Add-Certificate -ClusterConnectionParameters $clusterConnectionParameters -ConnectedServiceEndpoint $connectedServiceEndpoint
+            $clusterConnectionParameters["X509Credential"] = $true
+        }
+    }
+
+    # Connect to cluster
+    [void](Connect-ServiceFabricCluster @clusterConnectionParameters)
+    Write-Host (Get-VstsLocString -Key ConnectedToCluster)
     
     . "$PSScriptRoot\ServiceFabricSDK\ServiceFabricSDK.ps1"
 
-    $applicationName = Get-ApplicationNameFromApplicationParameterFile $publishProfile.ApplicationParameterFile
-    $app = Get-ServiceFabricApplication -ApplicationName $applicationName
-    
-    # Do an upgrade if the publish profile is configured to do so and the app actually exists
-    $isUpgrade = ($publishProfile.UpgradeDeployment -and $publishProfile.UpgradeDeployment.Enabled -and $app)
-    
-    if ($isUpgrade)
+    $applicationParameterFile = Get-SinglePathOfType (Get-VstsInput -Name applicationParameterPath) Leaf
+    if ($applicationParameterFile)
     {
-        Publish-UpgradedServiceFabricApplication -ApplicationPackagePath $applicationPackagePath -ApplicationParameterFilePath $publishProfile.ApplicationParameterFile -Action RegisterAndUpgrade -UpgradeParameters $publishProfile.UpgradeDeployment.Parameters -UnregisterUnusedVersions -ErrorAction Stop
+        Write-Host (Get-VstsLocString -Key OverrideApplicationParameterFile -ArgumentList $applicationParameterFile) 
+    }
+    elseif ($publishProfile)
+    {
+        $applicationParameterFile = $publishProfile.ApplicationParameterFile
     }
     else
     {
-        Publish-NewServiceFabricApplication -ApplicationPackagePath $ApplicationPackagePath -ApplicationParameterFilePath $publishProfile.ApplicationParameterFile -Action RegisterAndCreate -OverwriteBehavior SameAppTypeAndVersion -ErrorAction Stop 
+        throw (Get-VstsLocString -Key PublishProfileRequiredAppParams)
+    }
+
+    if ((Get-VstsInput -Name overridePublishProfileSettings) -eq "true")
+    {
+        Write-Host (Get-VstsLocString -Key OverrideUpgradeSettings)
+        $isUpgrade = (Get-VstsInput -Name isUpgrade) -eq "true"
+
+        if ($isUpgrade)
+        {
+            $upgradeParameters = Get-VstsUpgradeParameters
+        }
+    }
+    elseif ($publishProfile)
+    {
+        $isUpgrade = $publishProfile.UpgradeDeployment -and $publishProfile.UpgradeDeployment.Enabled
+        $upgradeParameters = $publishProfile.UpgradeDeployment.Parameters
+    }
+    else
+    {
+        throw (Get-VstsLocString -Key PublishProfileRequiredUpgrade)
+    }
+
+    $applicationName = Get-ApplicationNameFromApplicationParameterFile $applicationParameterFile
+    $app = Get-ServiceFabricApplication -ApplicationName $applicationName
+    
+    # Do an upgrade if configured to do so and the app actually exists
+    if ($isUpgrade -and $app)
+    {
+        Publish-UpgradedServiceFabricApplication -ApplicationPackagePath $applicationPackagePath -ApplicationParameterFilePath $applicationParameterFile -Action RegisterAndUpgrade -UpgradeParameters $upgradeParameters -UnregisterUnusedVersions -ErrorAction Stop
+    }
+    else
+    {
+        Publish-NewServiceFabricApplication -ApplicationPackagePath $ApplicationPackagePath -ApplicationParameterFilePath $applicationParameterFile -Action RegisterAndCreate -OverwriteBehavior SameAppTypeAndVersion -ErrorAction Stop 
     }
 } finally {
     Trace-VstsLeavingInvocation $MyInvocation
