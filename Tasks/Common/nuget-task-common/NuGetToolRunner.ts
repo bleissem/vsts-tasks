@@ -1,8 +1,7 @@
-import * as os from "os";
 import * as path from "path";
 import * as url from "url";
 import * as tl from "vsts-task-lib/task";
-import {IExecOptions, IExecResult, ToolRunner} from "vsts-task-lib/toolrunner";
+import {IExecOptions, IExecSyncResult, ToolRunner} from "vsts-task-lib/toolrunner";
 
 import * as auth from "./Authentication";
 import {NuGetQuirkName, NuGetQuirks, defaultQuirks} from "./NuGetQuirks";
@@ -24,7 +23,7 @@ function prepareNuGetExeEnvironment(
     let env: EnvironmentDictionary = {};
     let originalCredProviderPath: string;
     for (let e in input) {
-        if(input.hasOwnProperty(e)) {
+        if (!input.hasOwnProperty(e)) {
             continue;
         }
         // NuGet.exe extensions only work with a single specific version of nuget.exe. This causes problems
@@ -34,7 +33,7 @@ function prepareNuGetExeEnvironment(
                 tl.warning(tl.loc("NGCommon_IgnoringNuGetExtensionsPath"));
                 continue;
             } else {
-                tl._writeLine(tl.loc("NGCommon_DetectedNuGetExtensionsPath", input[e]));
+                console.log(tl.loc("NGCommon_DetectedNuGetExtensionsPath", input[e]));
             }
         }
 
@@ -62,6 +61,12 @@ function prepareNuGetExeEnvironment(
         env["NUGET_CREDENTIALPROVIDERS_PATH"] = credProviderPath;
     }
 
+    let httpProxy = getNuGetProxyFromEnvironment();
+    if (httpProxy) {
+        tl.debug(`Adding environment variable for NuGet proxy: ${httpProxy}`);
+        env["HTTP_PROXY"] = httpProxy;
+    }
+
     return env;
 }
 
@@ -69,19 +74,19 @@ export class NuGetToolRunner extends ToolRunner {
     private settings: NuGetEnvironmentSettings;
 
     constructor(nuGetExePath: string, settings: NuGetEnvironmentSettings) {
-        if (os.platform() === "win32" || !nuGetExePath.trim().toLowerCase().endsWith(".exe")) {
+        if (tl.osType() === 'Windows_NT' || !nuGetExePath.trim().toLowerCase().endsWith(".exe")) {
             super(nuGetExePath);
         }
         else {
             let monoPath = tl.which("mono", true);
             super(monoPath);
-            this.pathArg(nuGetExePath);
+            this.arg(nuGetExePath);
         }
 
         this.settings = settings;
     }
 
-    public execSync(options?: IExecOptions): IExecResult {
+    public execSync(options?: IExecOptions): IExecSyncResult {
         options = options || <IExecOptions>{};
         options.env = prepareNuGetExeEnvironment(options.env || process.env, this.settings);
         return super.execSync(options);
@@ -100,20 +105,29 @@ export function createNuGetToolRunner(nuGetExePath: string, settings: NuGetEnvir
     return runner;
 }
 
-interface LocateOptions {
+export interface LocateOptions {
     /** if true, search along the system path in addition to the hard-coded NuGet tool paths */
     fallbackToSystemPath?: boolean;
 
     /** Array of filenames to use when searching for the tool. Defaults to the tool name. */
     toolFilenames?: string[];
+
+    /** Array of paths to search under. Defaults to agent NuGet locations */
+    searchPath?: string[];
+
+    /** root that searchPaths are relative to. Defaults to the Agent.HomeDirectory build variable */
+    root?: string;
 }
 
-function locateTool(tool: string, opts?: LocateOptions) {
-    let searchPath = ["externals/nuget", "agent/Worker/Tools/NuGetCredentialProvider", "agent/Worker/Tools"];
-    let agentRoot = tl.getVariable("Agent.HomeDirectory");
+export function locateTool(tool: string, opts?: LocateOptions) {
+    const defaultSearchPath = ["externals/nuget", "agent/Worker/Tools/NuGetCredentialProvider", "agent/Worker/Tools"];
+    const defaultAgentRoot = tl.getVariable("Agent.HomeDirectory");
 
     opts = opts || {};
     opts.toolFilenames = opts.toolFilenames || [tool];
+
+    let searchPath = opts.searchPath || defaultSearchPath;
+    let agentRoot = opts.root || defaultAgentRoot;
 
     tl.debug(`looking for tool ${tool}`);
 
@@ -145,7 +159,7 @@ function locateTool(tool: string, opts?: LocateOptions) {
 
 export function locateNuGetExe(userNuGetExePath: string): string {
     if (userNuGetExePath) {
-        if (os.platform() === "win32") {
+        if (tl.osType() === 'Windows_NT') {
             userNuGetExePath = ngutil.stripLeadingAndTrailingQuotes(userNuGetExePath);
         }
 
@@ -155,7 +169,7 @@ export function locateNuGetExe(userNuGetExePath: string): string {
     }
 
     let toolPath = locateTool("NuGet", {
-        fallbackToSystemPath: os.platform() !== "win32",
+        fallbackToSystemPath: tl.osType() !== 'Windows_NT',
         toolFilenames: ["nuget.exe", "NuGet.exe", "nuget", "NuGet"],
     });
 
@@ -171,7 +185,7 @@ export async function getNuGetQuirksAsync(nuGetExePath: string): Promise<NuGetQu
         const version = await peParser.getFileVersionInfoAsync(nuGetExePath);
         const quirks = NuGetQuirks.fromVersion(version.fileVersion);
 
-        tl._writeLine(tl.loc("NGCommon_DetectedNuGetVersion", version.fileVersion, version.strings.ProductVersion));
+        console.log(tl.loc("NGCommon_DetectedNuGetVersion", version.fileVersion, version.strings.ProductVersion));
         tl.debug(`Quirks for ${version.fileVersion}:`);
         quirks.getQuirkNames().forEach(quirk => {
             tl.debug(`    ${quirk}`);
@@ -270,12 +284,24 @@ export function isCredentialConfigEnabled(quirks: NuGetQuirks): boolean {
     return true;
 }
 
-export function locateCredentialProvider(): string {
-    const credentialProviderLocation = locateTool("CredentialProvider.TeamBuild.exe");
-    if (!credentialProviderLocation) {
-        tl.debug("Credential provider is not present.");
-        return null;
+export function getNuGetProxyFromEnvironment(): string {
+    let proxyUrl: string = tl.getVariable("agent.proxyurl");
+    let proxyUsername: string = tl.getVariable("agent.proxyusername");
+    let proxyPassword: string = tl.getVariable("agent.proxypassword");
+
+    if (proxyUrl !== undefined) {
+        let proxy: url.Url = url.parse(proxyUrl);
+
+        if (proxyUsername !== undefined) {
+            proxy.auth = proxyUsername;
+
+            if (proxyPassword !== undefined) {
+                proxy.auth += `:${proxyPassword}`;
+            }
+        }
+
+        return url.format(proxy);
     }
 
-    return credentialProviderLocation;
+    return undefined;
 }

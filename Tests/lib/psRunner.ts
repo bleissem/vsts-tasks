@@ -14,6 +14,18 @@ function debug(message) {
     }
 }
 
+export function testSupported() {
+    if (!shell.which('powershell.exe')) {
+        return false;
+    }
+
+    return (process.env['TASK_TEST_RUNNER'] || 'ps')
+        .split(',')
+        .some(function (x) {
+            return x == 'ps';
+        });
+}
+
 export class PSRunner extends events.EventEmitter {
 	constructor() {
 		super();
@@ -29,9 +41,8 @@ export class PSRunner extends events.EventEmitter {
 	public start(): void {
 		this.emit('starting');
 		var defer = Q.defer<void>();
-		var powershell = shell.which('powershell.exe');
 		this._childProcess = child.spawn(
-			powershell, // command
+			"powershell.exe", // command
 			[ // args
 				'-NoLogo',
 				'-Sta',
@@ -66,7 +77,7 @@ export class PSRunner extends events.EventEmitter {
 			(data) => {
 				// Stderr indicates an error record was written to PowerShell's error pipeline.
 				debug('stderr: ' + data);
-				this._errors.push(data);
+				this._errors.push('' + data);
 			});
 	}
 

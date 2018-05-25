@@ -12,4 +12,6 @@ Export-ModuleMember -Function @(
     # Path functions.
     'Get-MSBuildPath'
     'Get-SolutionFiles'
+    'Get-VisualStudio_15_0'
+    'Select-MSBuildPath'
 )
